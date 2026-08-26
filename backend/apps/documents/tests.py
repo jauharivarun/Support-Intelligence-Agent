@@ -1,4 +1,5 @@
 from datetime import date
+import re
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -78,6 +79,22 @@ class DocumentRetrievalRankingTests(TestCase):
             domains=["CANCELLATION", "SERVICE_CREDIT"],
         )
         _add_doc(
+            name="Test Policy Update Version 2",
+            source_type=SourceType.POLICY_SOP,
+            status=DocumentStatus.CURRENT,
+            authority_level=90,
+            scope_type=ScopeType.GENERAL,
+            effective_date=date(2026, 8, 1),
+            explicit_override_domains=[],
+            content=(
+                "Updated default cancellation: after carrier assignment but before pickup, "
+                "fee is 2% of order value maximum INR 750. "
+                "Default maximum service credit: INR 1000 or 15% of eligible order value, whichever is lower. "
+                "Cancellation requests above INR 50000 require Priority Review before finalizing the fee."
+            ),
+            domains=["CANCELLATION", "SERVICE_CREDIT"],
+        )
+        _add_doc(
             name="ParcelPilot Support Policy v2",
             source_type=SourceType.DEPRECATED,
             status=DocumentStatus.DEPRECATED,
@@ -132,9 +149,12 @@ class DocumentRetrievalRankingTests(TestCase):
         )
         names = [r["document_name"] for r in result["results"]]
         self.assertNotIn("Northstar Logistics Enterprise Agreement", names)
-        self.assertEqual(result["source_resolution"]["primary_source"]["name"], "Cancellation & Service Credit SOP v4")
+        self.assertEqual(
+            result["source_resolution"]["primary_source"]["name"],
+            "Test Policy Update Version 2",
+        )
         labels = {r["document_name"]: r.get("label") for r in result["results"]}
-        self.assertEqual(labels.get("Cancellation & Service Credit SOP v4"), "ParcelPilot global policy")
+        self.assertEqual(labels.get("Test Policy Update Version 2"), "ParcelPilot global policy")
 
     def test_lumenworks_asking_about_northstar_is_denied(self):
         result = document_search(
@@ -191,3 +211,78 @@ class DocumentRetrievalRankingTests(TestCase):
             "Northstar Logistics Enterprise Agreement",
         )
         self.assertIn("not still true", result.get("decision_guidance", "").lower())
+
+    def test_global_cancel_defaults_prefer_higher_authority_v2(self):
+        result = document_search(
+            user_context(self.support),
+            "What is the default cancellation fee for a BOOKED shipment after carrier assignment but before pickup?",
+            domain="CANCELLATION",
+        )
+        self.assertIsNone(result.get("account_id"))
+        names = [r["document_name"] for r in result["results"]]
+        self.assertNotIn("Northstar Logistics Enterprise Agreement", names)
+        self.assertNotIn("LumenWorks Service Agreement", names)
+        self.assertEqual(
+            result["source_resolution"]["primary_source"]["name"],
+            "Test Policy Update Version 2",
+        )
+        self.assertEqual(result["source_resolution"]["primary_source"]["authority_level"], 90)
+        cite = [c["name"] for c in result.get("citation_sources") or []]
+        self.assertEqual(cite, ["Test Policy Update Version 2"])
+
+    def test_invalid_llm_domain_still_infers_cancellation(self):
+        """Models often pass source_type labels; those must not wipe applicable sources."""
+        result = document_search(
+            user_context(self.support),
+            "What is the default cancellation fee after carrier assignment?",
+            domain="POLICY_SOP",
+        )
+        self.assertEqual(result.get("domain"), "CANCELLATION")
+        self.assertEqual(
+            result["source_resolution"]["primary_source"]["name"],
+            "Test Policy Update Version 2",
+        )
+        self.assertEqual(
+            [c["name"] for c in result.get("citation_sources") or []],
+            ["Test Policy Update Version 2"],
+        )
+
+    def test_high_value_cancel_surfaces_priority_review_clause(self):
+        result = document_search(
+            user_context(self.support),
+            "A customer wants to cancel a ₹75,000 BOOKED shipment. What fee applies?",
+            domain="CANCELLATION",
+        )
+        self.assertEqual(
+            result["source_resolution"]["primary_source"]["name"],
+            "Test Policy Update Version 2",
+        )
+        joined = " ".join((r.get("content") or "") for r in result["results"]).lower()
+        flat = re.sub(r"\s+", "", joined)
+        self.assertIn("priorityreview", flat)
+        self.assertIn("priority review", result.get("decision_guidance", "").lower())
+
+    def test_global_service_credit_defaults_prefer_v2(self):
+        result = document_search(
+            user_context(self.support),
+            "What is the default maximum service credit under the current policy?",
+            domain="SERVICE_CREDIT",
+        )
+        self.assertEqual(
+            result["source_resolution"]["primary_source"]["name"],
+            "Test Policy Update Version 2",
+        )
+
+    def test_northstar_scoped_cancel_still_overrides_v2(self):
+        result = document_search(
+            user_context(self.support),
+            "Can ORD-1001 be cancelled without a fee for Northstar?",
+            domain="CANCELLATION",
+            account_id="ACCT-001",
+        )
+        self.assertEqual(result.get("account_id"), "ACCT-001")
+        self.assertEqual(result["source_resolution"]["status"], "OVERRIDE_APPLIED")
+        self.assertEqual(
+            result["source_resolution"]["primary_source"]["name"],
+            "Northstar Logistics Enterprise Agreement",
+        )

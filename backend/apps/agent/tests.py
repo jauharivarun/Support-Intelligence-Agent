@@ -38,17 +38,55 @@ class ToolSourceIngestTests(TestCase):
         status = _ingest_tool_sources(
             collected,
             {
-                "results": [{"document_name": "Cancellation & Service Credit SOP v4"}],
+                "citation_sources": [
+                    {"name": "Test Policy Update Version 2"},
+                    {"name": "Cancellation & Service Credit SOP v4"},
+                ],
+                "results": [{"document_name": "Noise Doc That Should Not Appear"}],
                 "source_resolution": {
-                    "status": "OVERRIDE_APPLIED",
-                    "primary_source": {"name": "Northstar Logistics Enterprise Agreement"},
+                    "status": "RESOLVED",
+                    "primary_source": {"name": "Test Policy Update Version 2"},
+                    "overridden_source": {"name": "Cancellation & Service Credit SOP v4"},
+                },
+                "primary_source_name": "Test Policy Update Version 2",
+            },
+        )
+        names = [s["name"] for s in collected]
+        self.assertIsNone(status)
+        self.assertEqual(names, ["Test Policy Update Version 2", "Cancellation & Service Credit SOP v4"])
+        self.assertNotIn("Noise Doc That Should Not Appear", names)
+
+    def test_needs_more_suppressed_when_primary_exists(self):
+        from apps.agent.orchestrator import _ingest_tool_sources
+
+        collected: list[dict] = []
+        status = _ingest_tool_sources(
+            collected,
+            {
+                "primary_source_name": "Test Policy Update Version 2",
+                "source_resolution": {
+                    "status": "NEEDS_MORE_INFORMATION",
+                    "primary_source": {"name": "Test Policy Update Version 2"},
                 },
             },
         )
-        names = {s["name"] for s in collected}
-        self.assertEqual(status, "OVERRIDE_APPLIED")
-        self.assertIn("Cancellation & Service Credit SOP v4", names)
-        self.assertIn("Northstar Logistics Enterprise Agreement", names)
+        self.assertIsNone(status)
+
+    def test_invented_order_calc_is_skipped_when_user_message_omits_it(self):
+        from apps.agent.tools import calculate_cancellation_fee
+        from apps.users.permissions import user_context
+
+        user = User.objects.create_user(
+            username="support-skip@test",
+            email="support-skip@test",
+            password="x",
+            role=Role.INTERNAL_SUPPORT,
+        )
+        ctx = user_context(user)
+        ctx["user_message"] = "What fee applies for a ₹75,000 BOOKED cancellation under current policy?"
+        result = calculate_cancellation_fee(ctx, "ORD-1001")
+        self.assertTrue(result.get("skipped"))
+        self.assertEqual(result.get("reason"), "order_id_not_in_user_message")
 
     def test_tool_error_is_marked_failed(self):
         payload = annotate_tool_result("document_search", {"error": "timeout"})

@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from rest_framework import serializers
 
 from apps.accounts.models import Account
@@ -7,9 +5,8 @@ from apps.documents.models import SourceDocument
 
 
 class SourceDocumentSerializer(serializers.ModelSerializer):
-    account_code = serializers.CharField(source="account.account_code", read_only=True, allow_null=True)
+    account_code = serializers.SerializerMethodField()
     chunk_count = serializers.IntegerField(source="chunks.count", read_only=True)
-    original_filename = serializers.CharField(source="original_filename", read_only=True)
 
     class Meta:
         model = SourceDocument
@@ -36,6 +33,11 @@ class SourceDocumentSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_account_code(self, obj) -> str | None:
+        if not obj.account_id:
+            return None
+        return obj.account.account_code
 
 
 class DocumentUploadSerializer(serializers.Serializer):

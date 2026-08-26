@@ -1,4 +1,6 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+const rawBase = import.meta.env.VITE_API_BASE
+const API_BASE =
+  rawBase === undefined ? 'http://127.0.0.1:8000' : String(rawBase).replace(/\/$/, '')
 
 let authToken: string | null = localStorage.getItem('pp_token')
 

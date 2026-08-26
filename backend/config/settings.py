@@ -3,6 +3,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
@@ -14,9 +15,29 @@ DOCS_DIR = Path(_docs_env) if _docs_env else BASE_DIR.parent / "Docs for impleme
 MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/media/"
 
+_INSECURE_SECRETS = {
+    "dev-insecure-parcelpilot-change-me",
+    "dev-jwt-secret",
+    "compose-dev-secret",
+    "compose-jwt-secret",
+}
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-insecure-parcelpilot-change-me")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
-ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if h.strip()
+]
+for _host in ("localhost", "127.0.0.1", "backend"):
+    if _host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_host)
+_jwt_secret = os.getenv("JWT_SECRET", SECRET_KEY)
+if not DEBUG:
+    if not SECRET_KEY or SECRET_KEY in _INSECURE_SECRETS:
+        raise ImproperlyConfigured("Set a unique DJANGO_SECRET_KEY when DEBUG=false")
+    if not _jwt_secret or _jwt_secret in _INSECURE_SECRETS:
+        raise ImproperlyConfigured("Set a unique JWT_SECRET when DEBUG=false")
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -94,9 +115,17 @@ TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+FILE_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
+DATA_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
+
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "false").lower() == "true"
+SESSION_COOKIE_SECURE = SECURE_SSL_REDIRECT
+CSRF_COOKIE_SECURE = SECURE_SSL_REDIRECT
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -110,7 +139,7 @@ REST_FRAMEWORK = {
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(hours=12),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
-    "SIGNING_KEY": os.getenv("JWT_SECRET", SECRET_KEY),
+    "SIGNING_KEY": _jwt_secret,
 }
 
 CORS_ALLOWED_ORIGINS = [
@@ -122,6 +151,11 @@ CORS_ALLOWED_ORIGINS = [
     if o.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",")
+    if o.strip()
+]
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")

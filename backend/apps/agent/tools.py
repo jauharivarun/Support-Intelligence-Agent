@@ -20,6 +20,7 @@ from apps.observability.models import ObservabilityEvent
 from apps.orders.models import Order
 from apps.source_resolution.engine import (
     SourceCandidate,
+    domain_matches,
     explicitly_overrides,
     is_temporally_valid,
     resolve_sources,
@@ -174,6 +175,15 @@ def _deny(ctx, tool_name, reason, session=None):
 # ---------- Structured data ----------
 
 def get_order(ctx: dict, order_id: str, session=None) -> dict:
+    if not order_id_in_user_turn(ctx, order_id):
+        return {
+            "skipped": True,
+            "reason": "order_id_not_in_user_message",
+            "agent_instruction": (
+                "The user did not name this order. Do not invent ORD-… ids. "
+                "For general policy questions, use document_search only."
+            ),
+        }
     t0 = time.time()
     try:
         order = Order.objects.select_related("account").get(order_id=order_id)
@@ -280,9 +290,21 @@ def get_tickets(ctx: dict, account_id: str, session=None) -> dict:
 
 # ---------- Document search ----------
 
+ALLOWED_POLICY_DOMAINS = frozenset(
+    {"CANCELLATION", "SERVICE_CREDIT", "SLA", "PRODUCT", "KNOWN_ISSUE"}
+)
+
+
 def infer_policy_domain(query: str, domain: str | None) -> str | None:
+    """Map a tool domain arg + query text to a known policy domain.
+
+    Models sometimes pass source_type labels (e.g. POLICY_SOP). Those are not domains
+    and would make resolve_sources exclude every real policy hit.
+    """
     if domain:
-        return domain
+        normalized = str(domain).strip().upper().replace(" ", "_").replace("-", "_")
+        if normalized in ALLOWED_POLICY_DOMAINS:
+            return normalized
     q = (query or "").lower()
     if any(
         w in q
@@ -296,6 +318,25 @@ def infer_policy_domain(query: str, domain: str | None) -> str | None:
     if any(w in q for w in ("bulk", "known issue", "ki-", "swift", "webhook")):
         return "PRODUCT"
     return None
+
+
+def _clean_account_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def order_id_in_user_turn(ctx: dict, order_id: str) -> bool:
+    """True when the latest user message names this order, or when no turn text is set.
+
+    Direct/unit tool calls omit user_message; only the live agent path sets it and
+    must block invented ORD-… ids.
+    """
+    msg = ctx.get("user_message")
+    if not msg:
+        return True
+    return bool(order_id) and order_id.upper() in msg.upper()
 
 
 def looks_like_historical_policy_claim(*texts: str) -> bool:
@@ -320,9 +361,9 @@ def resolve_document_search_account(
     """Customers stay on their account. Internal search follows THIS turn, not a prior ACCT-id."""
     allowed = ctx.get("allowed_account_ids")
     if allowed is not None:
-        return ctx.get("account_id")
+        return _clean_account_id(ctx.get("account_id"))
     user_msg = ctx.get("user_message") or ""
-    return (
+    return _clean_account_id(
         preferred_mentioned_account(user_msg)
         or preferred_mentioned_account(tool_query)
         or tool_account_id
@@ -380,11 +421,14 @@ def document_search(
     except PermissionError as e:
         return _deny(ctx, "document_search", str(e), session=session)
     account_id = resolve_document_search_account(ctx, query, account_id)
+    global_default_query = not account_id
 
     ref = date.fromisoformat(str(settings.DATASET_REFERENCE_TIME)[:10])
     query_vec = embed_query(query)
     ranked: list[tuple[float, float, DocumentChunk, SourceCandidate]] = []
     governing_best: dict[int, tuple[float, DocumentChunk, SourceCandidate]] = {}
+    # Best chunk per GENERAL/PRODUCT doc so higher-authority policies cannot lose the similarity race.
+    global_policy_best: dict[int, tuple[float, float, DocumentChunk, SourceCandidate]] = {}
 
     chunks = DocumentChunk.objects.select_related("document", "document__account").all()
     for chunk in chunks:
@@ -393,14 +437,18 @@ def document_search(
             continue
         if doc.status == DocumentStatus.CONTEXT_ONLY or doc.source_type == "HISTORICAL_CONTEXT":
             continue
-        if doc.account_id:
-            code = doc.account.account_code
-            if allowed is not None and code not in allowed:
+        if doc.account_id or doc.scope_type == "CUSTOMER_SPECIFIC":
+            if global_default_query:
+                # Default/global questions must not be polluted by customer agreements.
                 continue
-            if account_id and code != account_id:
+            code = doc.account.account_code if doc.account_id else None
+            if code:
+                if allowed is not None and code not in allowed:
+                    continue
+                if account_id and code != account_id:
+                    continue
+            elif doc.scope_type == "CUSTOMER_SPECIFIC":
                 continue
-        elif doc.scope_type == "CUSTOMER_SPECIFIC":
-            continue
         if not chunk.embedding:
             continue
         candidate = _chunk_to_candidate(chunk, domain)
@@ -417,25 +465,96 @@ def document_search(
             prev = governing_best.get(doc.id)
             if not prev or similarity > prev[0]:
                 governing_best[doc.id] = (similarity, chunk, candidate)
+        if candidate.scope_type in {"GENERAL", "PRODUCT"}:
+            domain_ok = (
+                not domain
+                or not candidate.domains
+                or domain_matches(domain, candidate.domains)
+                or domain_matches(domain, candidate.explicit_override_domains)
+            )
+            if domain_ok:
+                prev_g = global_policy_best.get(doc.id)
+                if not prev_g or similarity > prev_g[1]:
+                    global_policy_best[doc.id] = (rank, similarity, chunk, candidate)
 
     ranked.sort(key=lambda row: -row[0])
     selected: list[tuple[float, float, DocumentChunk, SourceCandidate]] = ranked[:top_k]
     selected_ids = {row[2].id for row in selected}
+
+    def _seat(row: tuple[float, float, DocumentChunk, SourceCandidate]) -> None:
+        nonlocal selected, selected_ids
+        _rank, _sim, chunk, _cand = row
+        if chunk.id in selected_ids:
+            return
+        selected.append(row)
+        selected_ids.add(chunk.id)
+
+    for row in global_policy_best.values():
+        _seat(row)
     for _sim, chunk, candidate in governing_best.values():
-        if chunk.id not in selected_ids:
-            selected.append(
+        _seat(
+            (
+                retrieval_rank_score(_sim, candidate, domain=domain, account_id=account_id),
+                _sim,
+                chunk,
+                candidate,
+            )
+        )
+
+    # High-value cancel questions need the Priority Review clause from the governing
+    # global policy, which often loses the single-best-chunk similarity race.
+    blob = f"{query} {user_msg}".lower().replace(",", "")
+    needs_priority_context = any(
+        p in blob
+        for p in (
+            "priority review",
+            "priority",
+            "75,000",
+            "75000",
+            "50,000",
+            "50000",
+            "high value",
+            "high-value",
+        )
+    ) or any(int(n) >= 50000 for n in re.findall(r"\d{5,}", blob))
+    if needs_priority_context and global_policy_best:
+        top_auth_doc_id = max(
+            global_policy_best.items(),
+            key=lambda item: item[1][3].authority_level,
+        )[0]
+        for chunk in DocumentChunk.objects.select_related("document", "document__account").filter(
+            document_id=top_auth_doc_id
+        ):
+            flat = re.sub(r"\s+", "", (chunk.content or "").lower())
+            if "priorityreview" not in flat and "inr50000" not in flat and "aboveinr50" not in flat:
+                continue
+            cand = _chunk_to_candidate(chunk, domain)
+            if not is_temporally_valid(cand, ref):
+                continue
+            sim = cosine_similarity(query_vec, chunk.embedding) if chunk.embedding else 0.0
+            _seat(
                 (
-                    retrieval_rank_score(
-                        _sim, candidate, domain=domain, account_id=account_id
-                    ),
-                    _sim,
+                    retrieval_rank_score(sim, cand, domain=domain, account_id=account_id) + 0.5,
+                    sim,
                     chunk,
-                    candidate,
+                    cand,
                 )
             )
-            selected_ids.add(chunk.id)
-    selected.sort(key=lambda row: -row[0])
-    selected = selected[: top_k + len(governing_best)]
+
+    # Prefer higher-authority seated policies at the front for the model.
+    selected.sort(
+        key=lambda row: (
+            -row[3].authority_level,
+            0 if row[3].scope_type in {"GENERAL", "PRODUCT"} else 1,
+            -row[0],
+        )
+    )
+    max_hits = max(
+        top_k,
+        len(global_policy_best) + len(governing_best) + 2,
+        top_k + len(governing_best) + 2,
+    )
+    selected = selected[:max_hits]
 
     results = []
     candidates: list[SourceCandidate] = []
@@ -502,7 +621,10 @@ def document_search(
         "Name sources accurately. Documents with label 'ParcelPilot global policy' are company-wide "
         "SOP/policy — never call them another customer's policies. "
         "When source_resolution.status is OVERRIDE_APPLIED, the primary_source (customer agreement) "
-        "is current for this account. SOP defaults that conflict with it are not this customer's rule."
+        "is current for this account. SOP defaults that conflict with it are not this customer's rule. "
+        "When primary_source is a GENERAL policy, answer default fees/credits ONLY from that document. "
+        "Do not quote lower-authority SOP numbers (e.g. INR 250 / 30 minutes) if a higher-authority "
+        "CURRENT policy is primary_source."
     )
     decision_guidance = ""
     if resolution.status == "OVERRIDE_APPLIED" and primary_name:
@@ -517,16 +639,53 @@ def document_search(
                 " The user is checking old agent/ticket guidance. Historical statements are CONTEXT_ONLY. "
                 "If that old guidance matches the overridden SOP and not the agreement, it is not still true."
             )
+    elif resolution.primary_source and resolution.primary_source.scope_type in {"GENERAL", "PRODUCT"}:
+        decision_guidance = (
+            f"primary_source for this query is {primary_name} "
+            f"(authority_level={resolution.primary_source.authority_level}). "
+            "For default/global cancel or credit rules, quote ONLY that document. "
+            "If it states a Priority Review threshold (e.g. order value above INR 50,000), "
+            "explain that review is required and do not finalize a fee until review is satisfied. "
+            "Do not invent a customer agreement or apply Northstar/LumenWorks terms unless the user "
+            "named that account or an order for that account."
+        )
+        if needs_priority_context:
+            decision_guidance += (
+                " This query involves a high-value cancellation. Version 2.0 requires Priority Review "
+                "before any final fee is presented — say that review is required; do not compute or "
+                "promise a finalized INR fee from the 2%/cap alone."
+            )
     elif looks_like_historical_policy_claim(query, user_msg):
         decision_guidance = (
             "The user is checking whether past guidance is still current. "
             "Use primary_source as current policy. Do not treat old tickets or prior agent quotes as rules."
+        )
+    # Citation list for the UI: primary (+ overridden), not every similarity hit.
+    citation_sources: list[dict] = []
+    if resolution.primary_source:
+        citation_sources.append(
+            {
+                "name": resolution.primary_source.name,
+                "document_name": resolution.primary_source.name,
+                "authority_level": resolution.primary_source.authority_level,
+                "scope_type": resolution.primary_source.scope_type,
+            }
+        )
+    if resolution.overridden_source:
+        citation_sources.append(
+            {
+                "name": resolution.overridden_source.name,
+                "document_name": resolution.overridden_source.name,
+                "authority_level": resolution.overridden_source.authority_level,
+                "scope_type": resolution.overridden_source.scope_type,
+            }
         )
     return {
         "query": query,
         "domain": domain,
         "account_id": account_id,
         "results": results,
+        "citation_sources": citation_sources,
         "source_resolution": result_to_dict(resolution),
         "primary_source_name": primary_name,
         "labeling_rule": labeling_rule,
@@ -537,6 +696,16 @@ def document_search(
 # ---------- Calculations ----------
 
 def calculate_cancellation_fee(ctx: dict, order_id: str, session=None) -> dict:
+    if not order_id_in_user_turn(ctx, order_id):
+        return {
+            "skipped": True,
+            "reason": "order_id_not_in_user_message",
+            "agent_instruction": (
+                "The user did not name this order. Do not invent or bind ORD-… ids for general "
+                "policy questions. Answer cancel rules from document_search primary_source only "
+                "(including Priority Review thresholds)."
+            ),
+        }
     order_data = get_order(ctx, order_id, session=session)
     if order_data.get("error"):
         return order_data
@@ -643,6 +812,15 @@ def calculate_cancellation_fee(ctx: dict, order_id: str, session=None) -> dict:
 
 
 def calculate_service_credit(ctx: dict, order_id: str, session=None) -> dict:
+    if not order_id_in_user_turn(ctx, order_id):
+        return {
+            "skipped": True,
+            "reason": "order_id_not_in_user_message",
+            "agent_instruction": (
+                "The user did not name this order. Do not invent ORD-… ids. Answer credit policy "
+                "from document_search primary_source only."
+            ),
+        }
     order_data = get_order(ctx, order_id, session=session)
     if order_data.get("error"):
         return order_data
@@ -929,7 +1107,10 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "name": "get_order",
-        "description": "Retrieve a shipment/order by order_id. Authorization is enforced server-side.",
+        "description": (
+            "Retrieve a shipment/order by order_id when the user explicitly named that ORD-… id. "
+            "Never invent an order id. Authorization is enforced server-side."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"order_id": {"type": "string"}},
@@ -986,7 +1167,11 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "name": "calculate_cancellation_fee",
-        "description": "Deterministically compute cancellation eligibility and fee for an order.",
+        "description": (
+            "Deterministically compute cancellation eligibility and fee for an order the user "
+            "explicitly named (ORD-…). Never invent an order id. For general/default fee or "
+            "Priority Review questions without an order id, use document_search only."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"order_id": {"type": "string"}},
@@ -996,7 +1181,10 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "name": "calculate_service_credit",
-        "description": "Deterministically compute failed-pickup service credit eligibility.",
+        "description": (
+            "Deterministically compute failed-pickup service credit eligibility for an order the "
+            "user explicitly named (ORD-…). Never invent an order id."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"order_id": {"type": "string"}},

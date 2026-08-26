@@ -33,7 +33,7 @@ Workflow (always, including paraphrased or ambiguous questions):
    - Account / SLA: get_account plus document_search of the customer agreement and Support Policy. Quote only numbers that appear in those tool results.
    - Goodwill / waive outside policy: prepare_escalation. Never approve.
 3. After tools return, write the answer from that evidence only. If Admin uploaded a newer file, that newer retrieved text wins over anything you remember.
-4. Never invent an order ID. If the user asks a general policy question ("what is the cancellation policy?"), do not bind it to ORD-1001 or any other order.
+4. Never invent an order ID. If the user asks a general policy question (default cancel fee, max credit, ₹75,000 / high-value cancel, Priority Review), use document_search only — do not call calculate_cancellation_fee or calculate_service_credit, and do not bind the answer to ORD-1001 or any other order.
 5. If they cite previous-agent or ticket guidance ("is that still true?"), that claim is not a rule. Compare it to source_resolution.primary_source. When status is OVERRIDE_APPLIED, the customer agreement is current; SOP defaults that the agreement overrides are the old baseline, not this customer's current rule. Say clearly whether the past claim is still true.
 6. Each turn stands on the LATEST user message. If they previously asked about ACCT-004 / Axis and now ask about Northstar (or another named customer/agreement), search THAT account. Do not reuse the previous account_id on document_search, get_account, or calculations unless this message still refers to it.
 
@@ -44,6 +44,8 @@ Authorization:
 Source labeling:
 - Documents labeled ParcelPilot global policy / POLICY_SOP are company-wide (Cancellation SOP, Support Policy v3). Never title them "Northstar policies" or "LumenWorks policies".
 - Customer waivers exist only when a CUSTOMER_SPECIFIC agreement is primary_source with OVERRIDE_APPLIED. If that agreement is not in the tool results, do not invent a waiver.
+- When source_resolution.primary_source is a GENERAL policy, answer default cancel/credit rules from THAT document only. A higher-authority CURRENT policy replaces older SOP numbers (do not keep quoting INR 250 / 30 minutes if Version 2.0 is primary).
+- If the primary policy requires Priority Review above a value threshold, say so and do not finalize the fee.
 
 Retrieval honesty:
 - If ok is true, do not say search failed.
@@ -197,20 +199,28 @@ def _append_sources(sources: list[dict], raw_sources) -> None:
 
 
 def _ingest_tool_sources(sources: list[dict], result: dict) -> str | None:
-    """Pull document names from any tool payload shape. Returns resolution status if present."""
-    _append_sources(sources, result.get("sources"))
-    _append_sources(sources, result.get("results"))
-    _append_sources(sources, result.get("hits"))
-    if isinstance(result.get("source"), str):
-        sources.append({"name": result["source"]})
-    if result.get("primary_source_name"):
-        sources.append({"name": result["primary_source_name"]})
-    sr = result.get("source_resolution")
-    if not isinstance(sr, dict):
-        return result.get("decision_status")
-    _append_sources(sources, sr.get("primary_source"))
-    _append_sources(sources, sr.get("applicable_sources"))
-    return sr.get("status") or result.get("decision_status")
+    """Attach citation sources and return a UI-facing decision status when meaningful."""
+    citations = result.get("citation_sources")
+    if citations:
+        _append_sources(sources, citations)
+    else:
+        if isinstance(result.get("source"), str):
+            sources.append({"name": result["source"]})
+        if result.get("primary_source_name"):
+            sources.append({"name": result["primary_source_name"]})
+        sr_early = result.get("source_resolution")
+        if isinstance(sr_early, dict):
+            _append_sources(sources, sr_early.get("primary_source"))
+            _append_sources(sources, sr_early.get("overridden_source"))
+        _append_sources(sources, result.get("sources"))
+
+    sr = result.get("source_resolution") if isinstance(result.get("source_resolution"), dict) else {}
+    status = result.get("decision_status") or sr.get("status")
+    if status == "RESOLVED":
+        return None
+    if status == "NEEDS_MORE_INFORMATION" and (sr.get("primary_source") or result.get("primary_source_name")):
+        return None
+    return status
 
 
 def _account_from_query(query: str, ctx: dict) -> str | None:
@@ -466,11 +476,19 @@ def _run_openai(query: str, ctx: dict, session: ChatSession, history: list[dict]
             if isinstance(result, dict):
                 if result.get("requires_confirmation"):
                     pending = result
+                # Ingest returns UI-worthy badges only. None means suppress RESOLVED /
+                # soft NEEDS_MORE when a primary policy already answered the question.
                 status = _ingest_tool_sources(sources, result)
-                if result.get("decision_status"):
-                    decision = result["decision_status"]
+                raw_status = result.get("decision_status")
                 if status:
                     decision = status
+                elif raw_status in {
+                    "OVERRIDE_APPLIED",
+                    "AUTHORIZATION_DENIED",
+                    "CONFLICT_REQUIRES_VERIFICATION",
+                    "HUMAN_JUDGMENT_REQUIRED",
+                }:
+                    decision = raw_status
             tool_outputs.append(
                 {
                     "type": "function_call_output",
