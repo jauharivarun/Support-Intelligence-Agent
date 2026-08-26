@@ -1,0 +1,61 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: parcelpilot
+      POSTGRES_USER: parcelpilot
+      POSTGRES_PASSWORD: parcelpilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parcelpilot -d parcelpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py seed_demo &&
+             python manage.py runserver 0.0.0.0:8000"
+    volumes:
+      - ./backend:/app
+      - ./Docs for implementation:/docs:ro
+    environment:
+      POSTGRES_DB: parcelpilot
+      POSTGRES_USER: parcelpilot
+      POSTGRES_PASSWORD: parcelpilot
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      DJANGO_SECRET_KEY: compose-dev-secret
+      JWT_SECRET: compose-jwt-secret
+      DEBUG: "true"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      USE_MOCK_EMBEDDINGS: ${USE_MOCK_EMBEDDINGS:-true}
+      DATASET_REFERENCE_TIME: "2026-08-16T11:00:00+05:30"
+      DOCS_DIR: /docs
+      CORS_ALLOWED_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  pp_pgdata:
